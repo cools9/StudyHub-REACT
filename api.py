@@ -1,10 +1,11 @@
-from flask import Flask, render_template, request, redirect, url_for, abort, session, flash
+from flask import Flask, jsonify, request, abort, make_response
 from supabase import create_client, Client
 import os
+import jwt
+from datetime import datetime, timedelta
 from functools import wraps
 
-app = Flask(__name__, template_folder='templates')
-app.secret_key = os.urandom(24)  # For session management
+app = Flask(__name__)
 
 # Supabase URL and API Key
 url = "https://xbsywxlzzvjkfnurmoaj.supabase.co"
@@ -13,123 +14,124 @@ key = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhi
 # Initialize Supabase client
 supabase: Client = create_client(url, key)
 
-# Custom login_required decorator
-def login_required(f):
+# JWT secret key
+JWT_SECRET = os.urandom(24)  # You can replace this with a fixed secret in production
+JWT_EXPIRATION_TIME_MINUTES = 30  # Token expiration time
+
+def token_required(f):
+    """Decorator to check for a valid JWT token in the request headers."""
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'username' not in session:
-            flash("Please log in to access this page.")
-            return redirect(url_for('login'))
+    def decorated(*args, **kwargs):
+        token = request.cookies.get('token')  # Get the token from the cookie
+
+        if not token:
+            return jsonify({"error": "Token is missing!"}), 401
+
+        try:
+            # Decode the token
+            data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            request.user = data['username']  # Store the username from the token in the request context
+        except jwt.ExpiredSignatureError:
+            return jsonify({"error": "Token has expired!"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"error": "Invalid token!"}), 401
+
         return f(*args, **kwargs)
-    return decorated_function
 
-@app.route('/')
-@login_required
-def main():
-    # Query the 'uploads' table
-    response = supabase.table("uploads").select("*").execute()
-    if response:
-        data = response.data
-    else:
-        data = []
+    return decorated
 
-    return render_template('index.html', data=data)
+def generate_token(username):
+    """Generate a JWT token for the given username."""
+    expiration_time = datetime.utcnow() + timedelta(minutes=JWT_EXPIRATION_TIME_MINUTES)
+    token = jwt.encode({'username': username, 'exp': expiration_time}, JWT_SECRET, algorithm="HS256")
+    return token
 
-@app.route('/signup', methods=['GET', 'POST'])
+@app.route('/api/signup', methods=['POST'])
 def signup():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
 
-        # Check if the user already exists
-        response = supabase.table("users").select("*").eq('username', username).execute()
-        if response.data:
-            # Redirect to login page if username already exists
-            flash("Username already exists, please log in.")
-            return redirect(url_for('login'))
+    # Check if the user already exists
+    response = supabase.table("users").select("*").eq('username', username).execute()
+    if response.data:
+        return jsonify({"message": "Username already exists, please log in."}), 400
 
-        # Insert new user into Supabase
-        response = supabase.table("users").insert({
-            'username': username,
-            'password': password
-        }).execute()
+    # Insert new user into Supabase
+    response = supabase.table("users").insert({'username': username, 'password': password}).execute()
+    if response.data:
+        token = generate_token(username)
+        resp = make_response(jsonify({"message": "User signed up successfully."}), 201)
+        # Set the token as an HTTP-only cookie
+        resp.set_cookie('token', token, httponly=True, secure=True, samesite='Strict')
+        return resp
+    else:
+        error_message = response.error or "Error signing up"
+        return jsonify({"error": error_message}), 500
 
-        if response.data:
-            # Set session and redirect to main
-            session['username'] = username
-            return redirect(url_for('main'))
-        else:
-            error_message = response.error or "Error signing up"
-            return f"{error_message}", 500
-
-    return render_template('signup.html')
-
-@app.route('/login', methods=['GET', 'POST'])
+@app.route('/api/login', methods=['POST'])
 def login():
-    if request.method == 'POST':
-        username = request.form.get('username')
-        password = request.form.get('password')
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
 
-        # Check if the username and password match
-        response = supabase.table("users").select("*").eq('username', username).eq('password', password).execute()
+    # Check if the username and password match
+    response = supabase.table("users").select("*").eq('username', username).eq('password', password).execute()
 
-        if response.data:
-            # Set session and redirect to main
-            session['username'] = username
-            return redirect(url_for('main'))
-        else:
-            flash("Invalid username or password")
-            return redirect(url_for('login'))
+    if response.data:
+        token = generate_token(username)
+        resp = make_response(jsonify({"message": "Logged in successfully."}), 200)
+        # Set the token as an HTTP-only cookie
+        resp.set_cookie('token', token, httponly=True, secure=True, samesite='Strict')
+        return resp
+    else:
+        return jsonify({"error": "Invalid username or password"}), 401
 
-    return render_template('login.html')
-
-@app.route('/logout')
+@app.route('/api/logout', methods=['POST'])
 def logout():
-    session.pop('username', None)
-    return redirect(url_for('login'))
+    resp = make_response(jsonify({"message": "Logged out successfully."}), 200)
+    # Clear the cookie by setting its expiration date in the past
+    resp.set_cookie('token', '', expires=0, httponly=True, secure=True, samesite='Strict')
+    return resp
 
-@app.route('/add-notes', methods=['GET', 'POST'])
-@login_required
+@app.route('/api/add-notes', methods=['POST'])
+@token_required
 def add_notes():
-    if request.method == 'POST':
-        title = request.form.get('title')
-        description = request.form.get('description')
-        content = request.form.get('content')
-        uploaded_by = session.get('username')  # Get the currently logged-in user's username
+    data = request.json
+    title = data.get('title')
+    description = data.get('description')
+    content = data.get('content')
+    uploaded_by = request.user  # Get the currently logged-in user's username from the token
 
-        # Insert new entry into Supabase
-        response = supabase.table("uploads").insert({
-            'title': title,
-            'description': description,
-            'content': content,
-            'uploaded_by': uploaded_by  # Add the username to the uploaded_by column
-        }).execute()
+    # Insert new entry into Supabase
+    response = supabase.table("uploads").insert({
+        'title': title,
+        'description': description,
+        'content': content,
+        'uploaded_by': uploaded_by
+    }).execute()
 
-        if response.data:
-            return redirect(url_for('main'))
-        else:
-            error_message = response.error or "Error adding entry"
-            return f"{error_message}", 500
+    if response.data:
+        return jsonify({"message": "Note added successfully."}), 201
+    else:
+        error_message = response.error or "Error adding entry"
+        return jsonify({"error": error_message}), 500
 
-    return render_template('add-notes.html')
-
-@app.route('/content/<int:content_id>')
-@login_required
-def content(content_id):
-    # Query the 'uploads' table for a specific content ID
+@app.route('/api/content/<int:content_id>', methods=['GET'])
+@token_required
+def get_content(content_id):
     response = supabase.table("uploads").select("*").eq('id', content_id).execute()
 
     if response and response.data:
-        content = response.data[0]  # Assuming there's only one result
+        content = response.data[0]
+        return jsonify(content)
     else:
-        abort(404)  # If not found, return a 404 error
+        return jsonify({"error": "Content not found"}), 404
 
-    return render_template('content.html', content=content)
-
-@app.route('/my-posts')
-@login_required
+@app.route('/api/my-posts', methods=['GET'])
+@token_required
 def my_posts():
-    username = session.get('username')  # Get the currently logged-in user's username
+    username = request.user  # Get the currently logged-in user's username from the token
 
     # Query the 'uploads' table for posts uploaded by the logged-in user
     response = supabase.table("uploads").select("*").eq('uploaded_by', username).execute()
@@ -139,22 +141,7 @@ def my_posts():
     else:
         data = []
 
-    return render_template('my_posts.html', data=data)
-
-@app.route('/session')
-@login_required
-def session_info():
-    return render_template('session.html')
-
-@app.route('/create-session')
-@login_required
-def session_creat():
-    return render_template('create_session.html')
-
-@app.route('/join-session')
-@login_required
-def session_join():
-    return render_template('join_session.html')
+    return jsonify(data)
 
 if __name__ == '__main__':
     app.run(debug=True)
